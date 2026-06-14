@@ -4,9 +4,9 @@ from .processor_multiarg import MultiargProcessor
 
 _DATASET_DIR = {
     'ace_eeqa':{
-        "train_file": './data/ace_eeqa/train_convert.json',
-        "dev_file": './data/ace_eeqa/dev_convert.json', 
-        "test_file": './data/ace_eeqa/test_convert.json',
+        "train_file": './data/ace_eeqa/data_final/train_convert.json',
+        "dev_file": './data/ace_eeqa/data_final/dev_convert.json', 
+        "test_file": './data/ace_eeqa/data_final/test_convert.json',
         "max_span_num_file": "./data/dset_meta/role_num_ace.json",
     },
     'rams':{

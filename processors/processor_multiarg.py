@@ -9,6 +9,14 @@ from copy import deepcopy
 from torch.utils.data import Dataset
 from processors.processor_base import DSET_processor
 from utils import EXTERNAL_TOKENS, _PREDEFINED_QUERY_TEMPLATE
+from torch.nn.utils.rnn import pad_sequence
+import statistics
+from collections import defaultdict
+import glob, json, math, tqdm, itertools
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 class InputFeatures(object):
@@ -20,7 +28,6 @@ class InputFeatures(object):
                  dec_prompt_text, dec_prompt_ids, dec_prompt_mask_ids,
                  arg_quries, arg_joint_prompt, target_info, enc_attention_mask,
                  old_tok_to_new_tok_index=None, full_text=None, arg_list=None
-
                  ):
 
         self.example_id = example_id
@@ -37,7 +44,7 @@ class InputFeatures(object):
         self.all_mask_ids = all_mask_ids
         self.enc_attention_mask = enc_attention_mask
 
-        self.dec_prompt_texts = dec_prompt_text
+        self.dec_prompt_text = dec_prompt_text
         self.dec_prompt_ids = dec_prompt_ids
         self.dec_prompt_mask_ids = dec_prompt_mask_ids
 
@@ -164,9 +171,21 @@ class ArgumentExtractionDataset(Dataset):
         all_ids = torch.tensor([f.all_ids for f in batch])
         all_mask_ids = torch.tensor([f.all_mask_ids for f in batch])
 
+        # if batch[0].dec_prompt_ids is not None:
+        #     dec_prompt_ids = torch.tensor([f.dec_prompt_ids for f in batch])
+        #     dec_prompt_mask_ids = torch.tensor([f.dec_prompt_mask_ids for f in batch])
+        # else:
+        #     dec_prompt_ids = None
+        #     dec_prompt_mask_ids = None
         if batch[0].dec_prompt_ids is not None:
-            dec_prompt_ids = torch.tensor([f.dec_prompt_ids for f in batch])
-            dec_prompt_mask_ids = torch.tensor([f.dec_prompt_mask_ids for f in batch])
+            
+            prompt_id_tensors = [torch.tensor(f.dec_prompt_ids)      for f in batch]
+            prompt_mk_tensors = [torch.tensor(f.dec_prompt_mask_ids) for f in batch]
+
+            dec_prompt_ids      = pad_sequence(prompt_id_tensors, batch_first=True,
+                                               padding_value=0)            
+            dec_prompt_mask_ids = pad_sequence(prompt_mk_tensors, batch_first=True,
+                                               padding_value=0)            
         else:
             dec_prompt_ids = None
             dec_prompt_mask_ids = None
@@ -216,7 +235,7 @@ class MultiargProcessor(DSET_processor):
         self.prompt_query = False
         if self.args.model_type == "base":
             self.arg_query = True
-        elif "DEEIA" in self.args.model_type:
+        elif "RoSE" in self.args.model_type:
             self.prompt_query = True
         else:
             raise NotImplementedError(f"Unexpected setting {self.args.model_type}")
@@ -232,6 +251,40 @@ class MultiargProcessor(DSET_processor):
             event_type, prompt = line.split(":")
             prompts[event_type] = prompt
         return prompts
+
+    @staticmethod
+    def _read_statistics_role_graph(file_path):
+        with open(file_path) as f:
+            weight_dict = json.load(f)
+        return weight_dict
+
+    @staticmethod
+    def _create_role_role_depen(examples, smooth = 1):
+        PAIR_CNT = defaultdict(int) # (event_type, role_i, role_j) -> c_ij
+        ROLE_CNT = defaultdict(int) # (event_type, role_i)         -> c_i
+
+        for example in examples:
+            for event_type, events in example.event_type_2_events.items():
+                for event in events:
+                    t = event["event_type"]
+                    rs = [arg[3] for arg in event["args"]]
+
+                    
+                    for r in set(rs):
+                        ROLE_CNT[(t, r)] += 1
+
+                    for r1, r2 in itertools.combinations(sorted(set(rs)), 2):
+                        PAIR_CNT[(t, r1, r2)] += 1
+                        PAIR_CNT[(t, r2, r1)] += 1
+        
+        weight = {}
+        for (t, ri, rj), c_ij in PAIR_CNT.items():
+            c_i = ROLE_CNT[(t, ri)]
+            alpha = (c_ij + smooth)/(c_i + smooth)
+            weight[(t, ri, rj)] = round(alpha, 4)
+
+        return weight
+
 
     def create_dec_qury(self, arg, event_trigger):
         dec_text = _PREDEFINED_QUERY_TEMPLATE.format(arg=arg, trigger=event_trigger)
@@ -263,6 +316,11 @@ class MultiargProcessor(DSET_processor):
 
         if os.environ.get("DEBUG", False): counter = [0, 0, 0]
         over_nums = 0
+
+        intra_slot_slot = self._create_role_role_depen(examples)
+        param_coref_weight = self._read_statistics_role_graph(self.args.statistics_role_graph_path)
+        
+
         for example in examples:
             example_id = example.doc_id
             context = example.context
@@ -334,6 +392,12 @@ class MultiargProcessor(DSET_processor):
                 new_tok = [new_tok_s, new_tok_e]
                 # print(new_tok)
                 old_tok_to_new_tok_index.append(new_tok)
+                assert new_tok_s is not None and new_tok_e is not None
+                assert 0 <= new_tok_s < len(enc_input_ids)
+                assert 0 < new_tok_e <= len(enc_input_ids)
+                if new_tok_s is None or new_tok_e is None:
+                    continue
+
 
             trigger_enc_token_index = []
             for t in triggers:
@@ -343,7 +407,7 @@ class MultiargProcessor(DSET_processor):
                 new_t_end = old_tok_to_new_tok_index[t_end - 1][1]
                 trigger_enc_token_index.append([new_t_start, new_t_end])
             for ii, it in enumerate(trigger_enc_token_index):
-                type_ids[it[0] - 1] = ii + 2  # context, type id 在10以内， 1表示正文， 大于1表示不同触发词
+                type_ids[it[0] - 1] = ii + 2  
             dec_table_ids = []
             dec_table_mask = []
 
@@ -355,8 +419,10 @@ class MultiargProcessor(DSET_processor):
             offset_prompt_ = 0
             kk = 0
             enc_attention_mask = torch.zeros((2, self.args.max_enc_seq_length, self.args.max_enc_seq_length),
-                                             dtype=torch.float32)   # 定义enc mask,用于DE module
-            # enc_attention_mask[0, :offset_prompt, :offset_prompt] = 1 # type1 context-context
+                                             dtype=torch.float32)   
+
+
+            all_event_slots = []   # [(event_type, slot_s, slot_e, role_str)]
             for i, event_type in enumerate(event_type_2_events):
                 events = event_type_2_events[event_type]
                 event_name = event_type.split('.')
@@ -364,6 +430,14 @@ class MultiargProcessor(DSET_processor):
                 for event in events:
                     enc_trigger_start, enc_trigger_end = trigger_enc_token_index[kk][0] - 1, \
                                                          trigger_enc_token_index[kk][1] + 1
+
+                    s_trig = trigger_enc_token_index[kk][0]     
+                    e_trig = trigger_enc_token_index[kk][1]     
+                    
+                    assert isinstance(s_trig, int) and isinstance(e_trig, int)
+                    assert 0 <= s_trig < e_trig <= self.args.max_enc_seq_length, \
+                        f"Trigger span 越界: {(s_trig, e_trig)} vs max {self.args.max_enc_seq_length}"
+
                     kk += 1
                     dec_prompt_text = prompts[event_type].strip()
                     assert dec_prompt_text
@@ -376,6 +450,7 @@ class MultiargProcessor(DSET_processor):
                     arg_2_prompt_slot_spans = dict()
                     num_prompt_slots = 0
                     if os.environ.get("DEBUG", False): arg_set = set()
+                    slot_spans_in_event = [] # [(slot_s, slot_e, role_str)]
                     for arg in arg_list:
                         prompt_slots = {
                             "tok_s": list(), "tok_e": list(),
@@ -400,56 +475,66 @@ class MultiargProcessor(DSET_processor):
                             prompt_slots["tok_s_off"].append(tok_prompt_s + offset_prompt + offset_prompt_);
                             prompt_slots["tok_e_off"].append(tok_prompt_e + offset_prompt + offset_prompt_)
                             num_prompt_slots += 1
+                            assert isinstance(tok_prompt_s, int) and isinstance(tok_prompt_e, int), "char_to_token returned None!"
+                            assert 0 <= tok_prompt_s < self.args.max_enc_seq_length
+                            assert tok_prompt_e <= self.args.max_enc_seq_length
+
+                        # trigger <-> role slot (intra event)
+                        for (tok_prompt_s, tok_prompt_e) in prompt_slot_spans:
+                            slot_s = tok_prompt_s + offset_prompt + offset_prompt_
+                            slot_e = tok_prompt_e + offset_prompt + offset_prompt_
+
+                            # trigger -> slot
+                            enc_attention_mask[0, enc_trigger_start:enc_trigger_end, slot_s:slot_e] = 1
+                            # slot -> trigger
+                            enc_attention_mask[0, slot_s:slot_e, enc_trigger_start:enc_trigger_end] = 1
+
+                            slot_spans_in_event.append((slot_s, slot_e, arg_))
+                            all_event_slots.append((event_type, slot_s, slot_e, arg_))
 
                         arg_2_prompt_slots[arg] = prompt_slots
                         arg_2_prompt_slot_spans[arg] = prompt_slot_spans
+                        
+                        # role <-> role slot (intra event)
+                        for (s1, e1, r1), (s2, e2, r2) in itertools.combinations(slot_spans_in_event, 2):
+                            if (event_type, r1, r2) not in intra_slot_slot.keys():
+                                intra_slot_slot[event_type, r1, r2] = 0.0
+                            w = intra_slot_slot[event_type, r1, r2]
+
+                            enc_attention_mask[0, s1:e1, s2:e2] = w
+                            enc_attention_mask[0, s2:e2, s1:e1] = w
+                    
 
                     list_arg_2_prompt_slots.append(arg_2_prompt_slots)
                     list_num_prompt_slots.append(num_prompt_slots)
                     list_dec_prompt_ids.append(dec_prompt_ids)
                     list_arg_2_prompt_slot_spans.append(arg_2_prompt_slot_spans)
-                    enc_attention_mask[0,
-                    enc_trigger_start:enc_trigger_end, \
-                    offset_prompt + offset_prompt_:offset_prompt + offset_prompt_ + len(
-                        dec_prompt_ids)] = 1  # type0 trigger-prompt
-                    enc_attention_mask[0, \
-                    offset_prompt + offset_prompt_:offset_prompt + offset_prompt_ + len(dec_prompt_ids),
-                    enc_trigger_start:enc_trigger_end] = 1  # type0 prompt-trigger
+                    
 
-                    enc_attention_mask[1,
-                    enc_trigger_start:enc_trigger_end,
-                    offset_prompt:offset_prompt + offset_prompt_] = 1  # type1 trigger-other prompt
-                    enc_attention_mask[1, enc_trigger_start:enc_trigger_end,
-                    offset_prompt + offset_prompt_ + len(dec_prompt_ids):] = 1  # type1 trigger-other prompt
-
-                    enc_attention_mask[1, offset_prompt:offset_prompt + offset_prompt_,
-                    enc_trigger_start:enc_trigger_end] = 1  # type1 trigger-other prompt
-                    enc_attention_mask[1, offset_prompt + offset_prompt_ + len(dec_prompt_ids):,
-                    enc_trigger_start:enc_trigger_end] = 1  # type1 trigger-other prompt
-
-                enc_attention_mask[0,
-                offset_prompt + offset_prompt_:offset_prompt + offset_prompt_ + len(dec_prompt_ids), \
-                offset_prompt + offset_prompt_:offset_prompt + offset_prompt_ + len(
-                    dec_prompt_ids)] = 1  # type0 prompt-prompt
-
-                enc_attention_mask[1,
-                offset_prompt + offset_prompt_:offset_prompt + offset_prompt_ + len(dec_prompt_ids),
-                offset_prompt:offset_prompt + offset_prompt_] = 1  # type1 prompt-other prompt
-                enc_attention_mask[1,
-                offset_prompt + offset_prompt_:offset_prompt + offset_prompt_ + len(dec_prompt_ids),
-                offset_prompt + offset_prompt_ + len(dec_prompt_ids):] = 1  # type1 prompt-other prompt
-
-                enc_attention_mask[1, offset_prompt:offset_prompt + offset_prompt_,
-                offset_prompt + offset_prompt_:offset_prompt + offset_prompt_ + len(
-                    dec_prompt_ids)] = 1  # type1 prompt-other prompt
-                enc_attention_mask[1, offset_prompt + offset_prompt_ + len(dec_prompt_ids):,
-                offset_prompt + offset_prompt_:offset_prompt + offset_prompt_ + len(
-                    dec_prompt_ids)] = 1  # type1 prompt-other prompt
-
+                
+                
                 offset_prompt_ += len(dec_prompt_ids)
                 dec_table_ids += dec_prompt_ids
                 dec_table_mask += dec_prompt_mask_ids
 
+            # # inter event 
+            for idx1 in range(len(all_event_slots)):
+                et1, s1, e1, r1 = all_event_slots[idx1]
+                for idx2 in range(idx1 + 1, len(all_event_slots)):
+                    et2, s2, e2, r2 = all_event_slots[idx2]
+                    if et1 == et2:
+                        continue
+                    key1 = f"{et1}|{r1}|{et2}|{r2}"
+                    # assert 0 <= s1 < e1 <= self.args.max_enc_seq_length
+                    # assert 0 <= s2 < e2 <= self.args.max_enc_seq_length
+                    if key1 not in param_coref_weight:
+                        param_coref_weight[key1] = 0.0
+                    
+                    w1 = param_coref_weight[key1] 
+
+                    enc_attention_mask[1, s1:e1, s2:e2] = w1
+                    enc_attention_mask[1, s2:e2, s1:e1] = w1
+                    
             all_ids.extend(dec_table_ids)
 
             all_mask_ids.extend(dec_table_mask)
@@ -537,7 +622,88 @@ class MultiargProcessor(DSET_processor):
             if len(list_arg_2_prompt_slots) == 1:
                 enc_attention_mask = torch.zeros((2, self.args.max_enc_seq_length, self.args.max_enc_seq_length),
                                                  dtype=torch.float32)
+                # deal single prompt
+                """ Deal with single prompt template """
+                offset_prompt_ = 0
+                kk = 0
+                all_event_slots = []   # [(event_type, slot_s, slot_e, role_str)]
+                for i, event_type in enumerate(event_type_2_events):
+                    events = event_type_2_events[event_type]
+                    event_name = event_type.split('.')
+                    event_name = ['<e-%d>' % (i)] + event_name + ['</e-%d>' % (i)]
+                    for event in events:
+                        enc_trigger_start, enc_trigger_end = trigger_enc_token_index[kk][0] - 1, \
+                                                            trigger_enc_token_index[kk][1] + 1
 
+                        s_trig = trigger_enc_token_index[kk][0]     
+                        e_trig = trigger_enc_token_index[kk][1]     
+                        
+                        assert isinstance(s_trig, int) and isinstance(e_trig, int)
+                        assert 0 <= s_trig < e_trig <= self.args.max_enc_seq_length, \
+                            f"Trigger span 越界: {(s_trig, e_trig)} vs max {self.args.max_enc_seq_length}"
+
+                        kk += 1
+                        dec_prompt_text = prompts[event_type].strip()
+                        assert dec_prompt_text
+                        dec_prompt_text = ' '.join(event_name) + ' ' + dec_prompt_text
+                        dec_prompt = self.tokenizer(dec_prompt_text, add_special_tokens=True)
+                        dec_prompt_ids, dec_prompt_mask_ids = dec_prompt["input_ids"], dec_prompt["attention_mask"]
+
+                        arg_list = self.argument_dict[event_type.replace(':', '.')]
+                        num_prompt_slots = 0
+                        if os.environ.get("DEBUG", False): arg_set = set()
+                        slot_spans_in_event = [] # [(slot_s, slot_e, role_str)]
+                        for arg in arg_list:
+                            prompt_slots = {
+                                "tok_s": list(), "tok_e": list(),
+                                "tok_s_off": list(), "tok_e_off": list(),
+                            }
+                            prompt_slot_spans = []
+
+                            if role_name_mapping is not None:
+                                arg_ = role_name_mapping[event_type][arg]
+                            else:
+                                arg_ = arg
+                            # Using this more accurate regular expression might further improve rams results
+                            for matching_result in re.finditer(r'\b' + re.escape(arg_) + r'\b',
+                                                            dec_prompt_text.split('.')[0]):
+                                char_idx_s, char_idx_e = matching_result.span();
+                                char_idx_e -= 1
+                                tok_prompt_s = dec_prompt.char_to_token(char_idx_s)
+                                tok_prompt_e = dec_prompt.char_to_token(char_idx_e) + 1
+                                prompt_slot_spans.append((tok_prompt_s, tok_prompt_e))
+                                prompt_slots["tok_s"].append(tok_prompt_s + offset_prompt_);
+                                prompt_slots["tok_e"].append(tok_prompt_e + offset_prompt_)
+                                prompt_slots["tok_s_off"].append(tok_prompt_s + offset_prompt + offset_prompt_);
+                                prompt_slots["tok_e_off"].append(tok_prompt_e + offset_prompt + offset_prompt_)
+                                num_prompt_slots += 1
+                                assert isinstance(tok_prompt_s, int) and isinstance(tok_prompt_e, int), "char_to_token returned None!"
+                                assert 0 <= tok_prompt_s < self.args.max_enc_seq_length
+                                assert tok_prompt_e <= self.args.max_enc_seq_length
+
+                            # trigger <-> role slot (intra event)
+                            for (tok_prompt_s, tok_prompt_e) in prompt_slot_spans:
+                                slot_s = tok_prompt_s + offset_prompt + offset_prompt_
+                                slot_e = tok_prompt_e + offset_prompt + offset_prompt_
+
+                                # trigger -> slot
+                                enc_attention_mask[0, enc_trigger_start:enc_trigger_end, slot_s:slot_e] = 1
+                                # slot -> trigger
+                                enc_attention_mask[0, slot_s:slot_e, enc_trigger_start:enc_trigger_end] = 1
+
+                                slot_spans_in_event.append((slot_s, slot_e, arg_))
+                                all_event_slots.append((event_type, slot_s, slot_e, arg_))
+
+                            arg_2_prompt_slots[arg] = prompt_slots
+                            
+                            # role <-> role slot (intra event)
+                            for (s1, e1, r1), (s2, e2, r2) in itertools.combinations(slot_spans_in_event, 2):
+                                if (event_type, r1, r2) not in intra_slot_slot.keys():
+                                    intra_slot_slot[event_type, r1, r2] = 0.0
+                                w = intra_slot_slot[event_type, r1, r2]
+
+                                enc_attention_mask[0, s1:e1, s2:e2] = w
+                                enc_attention_mask[0, s2:e2, s1:e1] = w
                 # NOTE: one annotation as one decoding input
             feature_idx = len(features)
 
@@ -551,7 +717,27 @@ class MultiargProcessor(DSET_processor):
                               arg_list=list_roles
                               )
             )
-        print(over_nums)
+            # enc_tokens = self.tokenizer.convert_ids_to_tokens(enc_input_ids)
+            # enc_tokens_ = dict()
+            # for i, token in enumerate(enc_tokens):
+            #     enc_tokens_[i] = token
+            # print(enc_tokens_)
+
+            # enc_tokens = self.tokenizer.convert_ids_to_tokens(all_ids)
+            # enc_tokens_ = dict()
+            # for i, token in enumerate(enc_tokens):
+            #     enc_tokens_[i] = token
+            # print(enc_tokens_)
+
+            # enc_tokens = self.tokenizer.convert_ids_to_tokens(all_ids)
+            # enc_tokens_ = dict()
+            # for i, token in enumerate(enc_tokens):
+            #     enc_tokens_[i] = token
+            # print(enc_tokens_)
+
+
+
+        # print(over_nums)
         if os.environ.get("DEBUG", False): print(
             '\033[91m' + f"distinct/tot arg_role: {counter[0]}/{counter[1]} ({counter[2]})" + '\033[0m')
         return features

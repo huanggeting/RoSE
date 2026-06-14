@@ -1,5 +1,6 @@
 import os
 os.environ['MKL_SERVICE_FORCE_INTEL'] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 if os.environ.get('DEBUG', False): print('\033[92m' + 'Running code in DEBUG mode' + '\033[0m')
 import logging
 from models import build_model

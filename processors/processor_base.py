@@ -211,6 +211,8 @@ class DSET_processor:
             return self._create_example(lines, over_sample=('power' if set_type == 'train' else None))
         elif self.args.dataset_type == 'wikievent':
             return self._create_example(lines, over_sample=('double' if set_type == 'train' else None))
+        elif self.args.dataset_type == 'ace_eeqa':
+            return self._create_example(lines, over_sample=('power' if set_type=='train' else None))
         else:
             raise NotImplementedError()
     def convert_examples_to_features(self, examples, role_name_mapping=None):

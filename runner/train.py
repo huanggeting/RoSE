@@ -2,7 +2,7 @@ import torch.nn as nn
 import logging
 from torch.utils.data import DataLoader, RandomSampler
 logger = logging.getLogger(__name__)
-
+import torch
 
 class BaseTrainer:
     def __init__(
@@ -97,7 +97,8 @@ class Trainer(BaseTrainer):
             'arg_joint_prompts': batch[10],
             'arg_list': batch[11],
             'event_triggers': batch[-2],
-            'enc_attention_mask': batch[-1]
+            'enc_attention_mask': batch[-1],
         }
+        
 
         return inputs

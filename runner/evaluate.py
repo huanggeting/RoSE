@@ -80,7 +80,7 @@ class Evaluator(BaseEvaluator):
 
     
     def convert_batch_to_inputs(self, batch):
-        if self.cfg.model_type=="DEEIA":
+        if self.cfg.model_type=="RoSE":
             inputs = {
                 'enc_input_ids': batch[0].to(self.cfg.device),
                 'enc_mask_ids': batch[1].to(self.cfg.device),

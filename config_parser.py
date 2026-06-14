@@ -3,8 +3,8 @@ import argparse
 
 def get_args_parser():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--model_type", default='DEEIA', type=str,
-                        help="which types of model you would use. model with multi-prompt(DEEIA) or single-prompt(base)")
+    parser.add_argument("--model_type", default='RoSE', type=str,
+                        help="which types of model you would use. model with multi-prompt(RoSE) or single-prompt(base)")
     parser.add_argument("--model_name_or_path", default="./ckpts/bart-base", type=str,
                         help="pre-trained language model")
     parser.add_argument("--dataset_type", default="rams", type=str,
@@ -13,6 +13,8 @@ def get_args_parser():
                         help="a file containing all role names. Read it to access all argument roles of this dataset")
     parser.add_argument("--prompt_path", default='./data/prompts/prompts_rams_full.csv', type=str,
                         help="a file containing all prompts we use for this dataset")
+    parser.add_argument("--statistics_role_graph_path", default='./data/dset_meta/role_coref_weight_rams.json', type=str,
+                        help="a file containing all role statistics. Read it to access all argument roles relations of this dataset")
     parser.add_argument("--output_dir", default='./outputs_res', type=str,
                         help="output folder storing checkpoint and all sorts of log files")
     parser.add_argument("--keep_ratio", default=1.0, type=float,
@@ -58,7 +60,7 @@ def get_args_parser():
 
 
     # setting only for the situation when inference_only
-    parser.add_argument('--inference_model_path', default="/home/nlp/lwl/project/NLP/IJCAI2024/new/DEEIA_v2.2_opt/exps/wikievent/test/checkpoint_ours_single", type=str,
+    parser.add_argument('--inference_model_path', default="", type=str,
                         help="The path of checkpoint used for inference.")
     # setting only for base model.
     parser.add_argument("--max_dec_seq_length", default=20, type=int,
@@ -67,7 +69,7 @@ def get_args_parser():
                         help="maximum arguments extracted for one role.")
     parser.add_argument('--th_delta', default=.0, type=float,
                         help="threshold controlling whether accept a candiate span as argument or not")
-    # setting only for DEEIA model
+    # setting only for RoSE model
     parser.add_argument("--max_prompt_seq_length", default=64, type=int,
                         help="maximum length for multi-prompt")
     parser.add_argument('--matching_method_train', default="max", choices=["max", 'accurate'], type=str,

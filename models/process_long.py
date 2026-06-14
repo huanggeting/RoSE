@@ -6,7 +6,7 @@ import numpy as np
 def process_long_input(model, input_ids, attention_mask, start_tokens, end_tokens, structural_mask):
     # Split the input to 2 overlapping chunks. Now BERT can encode inputs of which the length are up to 1024.
     n, c = input_ids.size()
-    start_tokens = torch.tensor(start_tokens).to(input_ids)#转为Tensor放入cuda
+    start_tokens = torch.tensor(start_tokens).to(input_ids)
     end_tokens = torch.tensor(end_tokens).to(input_ids)
     len_start = start_tokens.size(0)
     len_end = end_tokens.size(0)
@@ -101,7 +101,7 @@ def process_long_input(model, input_ids, attention_mask, start_tokens, end_token
 def process_long_input_decode(model, input_ids, attention_mask, start_tokens, end_tokens, enc_attention_mask, enc_hidden):
     # Split the input to 2 overlapping chunks. Now BERT can encode inputs of which the length are up to 1024.
     n, c = input_ids.size()
-    start_tokens = torch.tensor(start_tokens).to(input_ids)#转为Tensor放入cuda
+    start_tokens = torch.tensor(start_tokens).to(input_ids)
     end_tokens = torch.tensor(end_tokens).to(input_ids)
     len_start = start_tokens.size(0)
     len_end = end_tokens.size(0)

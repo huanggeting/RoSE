@@ -5,9 +5,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 from transformers import BartConfig, BartTokenizerFast
-from transformers import AdamW, get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup
+from torch.optim import AdamW
 
-from .DEEIA import DEEIA
+from .RoSE import RoSE
 from .single_prompt import BartSingleArg
 from utils import EXTERNAL_TOKENS
 from processors.processor_multiarg import MultiargProcessor
@@ -16,9 +17,10 @@ from processors.processor_multiarg import MultiargProcessor
 from transformers import RobertaConfig, RobertaTokenizerFast
 import os
 os.environ['TRANSFORMERS_CACHE'] = './'
-
+import torch
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 def build_model(args, model_type):
-    config_class, model_class, tokenizer_class = (RobertaConfig, DEEIA, RobertaTokenizerFast)
+    config_class, model_class, tokenizer_class = (RobertaConfig, RoSE, RobertaTokenizerFast)
     if args.inference_only:
         config = config_class.from_pretrained(args.inference_model_path)
     else:
@@ -40,11 +42,12 @@ def build_model(args, model_type):
     config.bipartite = args.bipartite
     config.matching_method_train = args.matching_method_train
 
-    tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path, add_special_tokens=True)
+    tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path, special=True)
     if args.inference_only:
-        model = model_class.from_pretrained(args.inference_model_path, from_tf=bool('.ckpt' in args.inference_model_path), config=config)
+        model = model_class.from_pretrained(args.inference_model_path, from_tf=bool('.ckpt' in args.inference_model_path), config=config, local_files_only=True)
     else:
-        model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
+        model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path), config=config, local_files_only=True)
+        model.reset()
 
     # Add trigger special tokens and continuous token (maybe in prompt)
     new_token_list = copy.deepcopy(EXTERNAL_TOKENS)
@@ -57,6 +60,7 @@ def build_model(args, model_type):
     tokenizer.add_tokens(new_token_list)   
     logger.info("Add tokens: {}".format(new_token_list))      
     model.resize_token_embeddings(len(tokenizer))
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
     if args.inference_only:
         optimizer, scheduler = None, None

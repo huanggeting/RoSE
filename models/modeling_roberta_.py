@@ -4,6 +4,69 @@ _CHECKPOINT_FOR_DOC = "roberta-base"
 _CONFIG_FOR_DOC = "RobertaConfig"
 _TOKENIZER_FOR_DOC = "RobertaTokenizer"
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+def create_position_ids_from_input_ids(input_ids, padding_idx, past_key_values_length=0):
+    """
+    Replace non-padding symbols with their position numbers. Position numbers begin at padding_idx+1. Padding symbols
+    are ignored. This is modified from fairseq's `utils.make_positions`.
+
+    Args:
+        x: torch.Tensor x:
+
+    Returns: torch.Tensor
+    """
+    # The series of casts and type-conversions here are carefully balanced to both work with ONNX export and XLA.
+    mask = input_ids.ne(padding_idx).int()
+    incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask) + past_key_values_length) * mask
+    return incremental_indices.long() + padding_idx
+
+# ==================CAF==================
+# fuse the prior and context
+class SharedGATStructureModulator(nn.Module):
+    def __init__(self, in_dim, out_dim, n_heads=1, dropout=0.1, alpha=0.2, top_k=None):
+        super().__init__()
+        self.n_heads = n_heads
+        self.out_dim = out_dim
+        self.top_k = top_k
+        self.W = nn.Linear(in_dim, n_heads * out_dim, bias=False)
+        self.a = nn.Linear(2 * out_dim, 1, bias=False)
+        self.leakyrelu = nn.LeakyReLU(alpha)
+        self.dropout = nn.Dropout(dropout)
+        self.gamma = nn.Parameter(torch.ones(2))
+
+    def forward(self, X, prior_mask):
+        B, L, D = X.shape
+        Wh = self.W(X).view(B, L, self.n_heads, self.out_dim)  # [B, L, H, D']
+
+        Wh_i = Wh.unsqueeze(2).expand(B, L, L, self.n_heads, self.out_dim)
+        Wh_j = Wh.unsqueeze(1).expand(B, L, L, self.n_heads, self.out_dim)
+        a_input = torch.cat([Wh_i, Wh_j], dim=-1)  
+
+        e = self.leakyrelu(self.a(a_input).squeeze(-1))
+        e = e.permute(0, 3, 1, 2)
+        attn = F.softmax(e, dim=-1)
+        attn = self.dropout(attn)
+        avg_edge = attn.mean(dim=1)
+
+        if self.top_k is not None:
+            topk_val, topk_idx = torch.topk(avg_edge, self.top_k, dim=-1)
+            mask = torch.zeros_like(avg_edge).scatter(-1, topk_idx, 1.0)
+            avg_edge = avg_edge * mask
+
+        avg_edge = avg_edge.detach()
+
+        outputs = []
+        for i in range(2):
+            fused = (1 - self.gamma[i]) * avg_edge + self.gamma[i] * prior_mask[:, i]
+            outputs.append(fused.unsqueeze(1))
+
+        return torch.cat(outputs, dim=1)
+
 
 class RobertaEmbeddings(nn.Module):
     """
@@ -126,9 +189,6 @@ class RobertaSelfAttention(nn.Module):
                     [nn.Parameter(nn.init.xavier_uniform_(
                         torch.empty(self.num_attention_heads, self.attention_head_size, self.attention_head_size)))
                      for _ in range(num_structural_dependencies)])
-            self.abs_bias = nn.ParameterList(
-                [nn.Parameter(torch.zeros(self.num_attention_heads)) for _ in range(num_structural_dependencies)])
-
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
@@ -184,7 +244,7 @@ class RobertaSelfAttention(nn.Module):
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-        # ==================DE==================
+        # ==================RoGE==================
         # add attentive bias according to dependencies
         if self.structural_mask != 'none':
             for i in range(2):
@@ -193,11 +253,10 @@ class RobertaSelfAttention(nn.Module):
                         -1).repeat(1, 1, 1, query_layer.size(2))
                     attention_bias_k = torch.einsum("nd,bnjd->bnj", self.bias_layer_q[i], key_layer).unsqueeze(
                         -2).repeat(1, 1, key_layer.size(2), 1)
-                    attention_scores += self.gamma * (attention_bias_q + attention_bias_k + self.abs_bias[i][None, :, None, None]) * \
-                                        structure_mask[i]
+                    attention_scores += (attention_bias_q + attention_bias_k) * structure_mask[:, i].unsqueeze(1)
                 elif self.structural_mask == 'biaffine':
                     attention_bias = torch.einsum("bnip,npq,bnjq->bnij", query_layer, self.bili[i], key_layer)
-                    attention_scores += self.gamma * (attention_bias + self.abs_bias[i][None, :, None, None]) * structure_mask[i]
+                    attention_scores += (attention_bias) * structure_mask[:, i].unsqueeze(1)
 
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
             seq_length = hidden_states.size()[1]
@@ -543,6 +602,19 @@ class RobertaModel_(RobertaPreTrainedModel):
 
         self.pooler = RobertaPooler(config) if add_pooling_layer else None
 
+        print(structural_mask)
+        if structural_mask == 'biaffine':
+            self.structure_mask_modulator = SharedGATStructureModulator(
+                in_dim=config.hidden_size,
+                out_dim=config.hidden_size // 4,
+                n_heads=4,
+                dropout=0.1,
+                alpha=0.2,
+                top_k=64
+            )
+        else:
+            self.structure_mask_modulator = None
+
         self.init_weights()
 
     def get_input_embeddings(self):
@@ -744,7 +816,14 @@ class RobertaModel_(RobertaPreTrainedModel):
             embedding_output = inputs_embeds
 
         if structural_mask is not None:
-            structural_mask = structural_mask.transpose(0, 1)[:, :, None, :, :].to(embedding_output)
+            structural_mask = structural_mask.to(embedding_output)
+
+        if structural_mask is not None and self.structure_mask_modulator is not None:
+            structural_mask = self.structure_mask_modulator(embedding_output, structural_mask)  # [B, 2, L, L]
+                
+            
+
+
         encoder_outputs = self.encoder(
             embedding_output,
             attention_mask=extended_attention_mask,
@@ -774,4 +853,3 @@ class RobertaModel_(RobertaPreTrainedModel):
             attentions=encoder_outputs.attentions,
             cross_attentions=encoder_outputs.cross_attentions,
         )
-
