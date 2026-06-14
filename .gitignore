@@ -1,13 +1,25 @@
+# ===== dataset =====
 data/
+
+# ===== pretrained model =====
+roberta-large/
+
+# ===== cache =====
 __pycache__/
 *.pyc
+
+# ===== model weights =====
+*.pt
 *.pth
 *.bin
 *.ckpt
+
+# ===== experiments =====
+exps/
 experiments/
-exps/
-data/
-models/
-exps/
-roberta-large/
-*.pt
+logs/
+runs/
+
+# ===== IDE =====
+.vscode/
+.idea/
