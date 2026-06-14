@@ -64,3 +64,19 @@ bash ./scripts/infer_wikievent_roberta.sh
 bash ./scripts/infer_rams_roberta.sh
 bash ./scripts/infer_mlee_roberta.sh
 ```
+
+## 📚 Citation
+
+If you find this work useful, please cite:
+
+```bibtex
+@inproceedings{huang2026rose,
+  title={RoSE: A Role Correlation Structure-Enhanced Model for Multi-Event Argument Extraction},
+  author={Huang, Geting and Zhang, Jilong and Zhou, Kai and Yi, Zhang and Xu, Xiuyuan},
+  booktitle={Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume={40},
+  number={37},
+  pages={31131--31139},
+  year={2026}
+}
+```

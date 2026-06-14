@@ -42,6 +42,7 @@ class RoSE(RobertaPreTrainedModel):
             self.roberta = RobertaModel_(config, decode_layer_start=decode_layer_start, structural_mask=config.structural_type)
         else:
             pass
+        # 
         self.w_prompt_start = nn.Parameter(torch.rand(config.hidden_size, ))
         self.w_prompt_end = nn.Parameter(torch.rand(config.hidden_size, ))
         self.decode_layer_start = decode_layer_start
@@ -158,8 +159,8 @@ class RoSE(RobertaPreTrainedModel):
                             prompt_query_sub = self.prompt_context_fusion(prompt_query_sub, context_rs)
                             pass
                             
-                        start_query = (prompt_query_sub*self.w_prompt_start).unsqueeze(-1)
-                        end_query = (prompt_query_sub*self.w_prompt_end).unsqueeze(-1)
+                        start_query = (prompt_query_sub*self.w_prompt_start).unsqueeze(-1) # [1, H, 1]
+                        end_query = (prompt_query_sub*self.w_prompt_end).unsqueeze(-1)     # [1, H, 1]
 
                     
                         start_logits = torch.bmm(context_output.unsqueeze(0), start_query).squeeze()

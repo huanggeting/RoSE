@@ -149,7 +149,7 @@ def eval_head_f1_score(features, invalid_gt_num=0):
 
 
 def show_results(features, output_file, metainfo):
-    """ DEEIA std show resuults """
+    """ RoSE std show resuults """
     with open(output_file, 'w', encoding='utf-8') as f:
         "0: wrong span; 1:partial; 2:overlapping; 3:missing; 4:over extracting"
         error_types = ["wrong span", "partial", "overlapping", "missing", "over extracting"]
